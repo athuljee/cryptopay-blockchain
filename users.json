@@ -1,0 +1,52 @@
+[
+  {
+    "username": "athul",
+    "password": "1234",
+    "role": "client",
+    "wallet": {
+      "BTC": 0.0523,
+      "ETH": 1.1731,
+      "USDT": 5000
+    }
+  },
+  {
+    "username": "merchant1",
+    "password": "1234",
+    "role": "merchant",
+    "wallet": {
+      "BTC": 0,
+      "ETH": 0,
+      "USDT": 0
+    }
+  },
+  {
+    "username": "merchant2",
+    "password": "1234",
+    "role": "merchant",
+    "wallet": {
+      "BTC": 0,
+      "ETH": 0,
+      "USDT": 0
+    }
+  },
+  {
+    "username": "anjana",
+    "password": "1234",
+    "role": "client",
+    "wallet": {
+      "BTC": 0,
+      "ETH": 0,
+      "USDT": 0
+    }
+  },
+  {
+    "username": "grizi",
+    "password": "678",
+    "role": "client",
+    "wallet": {
+      "BTC": 0,
+      "ETH": 0,
+      "USDT": 0
+    }
+  }
+]
