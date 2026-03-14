@@ -8,6 +8,12 @@ const supabase = createClient(
 const express = require("express");
 const bodyParser = require("body-parser");
 const SHA256 = require("crypto-js/sha256");
+const AES = require("crypto-js/aes");
+const Utf8 = require("crypto-js/enc-utf8");
+
+/* ---------------- ENCRYPTION KEY ---------------- */
+
+const ENCRYPTION_KEY = "CryptoPay2024SecureKey!@#";
 const cors = require("cors");
 
 const app = express();
@@ -76,11 +82,6 @@ class Blockchain {
         this.chain = [this.createGenesisBlock()];
         this.difficulty = 2;
         this.pendingTransactions = [];
-
-        this.balances = {
-            athul: { BTC: 0.0523, ETH: 1.1731, USDT: 5000 },
-            merchant1: { BTC: 0, ETH: 0, USDT: 0 }
-        };
     }
 
     createGenesisBlock() {
@@ -91,21 +92,80 @@ class Blockchain {
         return this.chain[this.chain.length - 1];
     }
 
-    addTransaction(transaction) {
+    async addTransaction(transaction) {
 
         const { sender, receiver, amount, token } = transaction;
 
-        if (!this.balances[sender]) {
-            return { success: false, message: "Sender not found" };
+        try {
+            // Get sender balance
+            const { data: senderData, error: senderError } = await supabase
+                .from('users')
+                .select('btc, eth, usdt')
+                .eq('username', sender)
+                .single();
+
+            if (senderError || !senderData) {
+                return { success: false, message: "Sender not found" };
+            }
+
+            // Get receiver balance
+            const { data: receiverData, error: receiverError } = await supabase
+                .from('users')
+                .select('btc, eth, usdt')
+                .eq('username', receiver)
+                .single();
+
+            if (receiverError || !receiverData) {
+                return { success: false, message: "Receiver not found" };
+            }
+
+            const senderBalance = {
+                BTC: parseFloat(senderData.btc || 0),
+                ETH: parseFloat(senderData.eth || 0),
+                USDT: parseFloat(senderData.usdt || 0)
+            };
+
+            if (senderBalance[token] < amount) {
+                return { success: false, message: "Insufficient balance" };
+            }
+
+            // Update sender balance
+            const newSenderBalance = { ...senderBalance };
+            newSenderBalance[token] -= amount;
+
+            await supabase
+                .from('users')
+                .update({
+                    btc: newSenderBalance.BTC,
+                    eth: newSenderBalance.ETH,
+                    usdt: newSenderBalance.USDT
+                })
+                .eq('username', sender);
+
+            // Update receiver balance
+            const receiverBalance = {
+                BTC: parseFloat(receiverData.btc || 0),
+                ETH: parseFloat(receiverData.eth || 0),
+                USDT: parseFloat(receiverData.usdt || 0)
+            };
+            receiverBalance[token] += amount;
+
+            await supabase
+                .from('users')
+                .update({
+                    btc: receiverBalance.BTC,
+                    eth: receiverBalance.ETH,
+                    usdt: receiverBalance.USDT
+                })
+                .eq('username', receiver);
+
+            this.pendingTransactions.push(transaction);
+
+            return { success: true };
+        } catch (err) {
+            console.error('Error in addTransaction:', err);
+            return { success: false, message: "Transaction failed" };
         }
-
-        if (this.balances[sender][token] < amount) {
-            return { success: false, message: "Insufficient balance" };
-        }
-
-        this.pendingTransactions.push(transaction);
-
-        return { success: true };
     }
 
     async minePendingTransactions() {
@@ -124,14 +184,6 @@ class Blockchain {
         block.mineBlock(this.difficulty);
 
         for (const tx of this.pendingTransactions) {
-
-            this.balances[tx.sender][tx.token] -= tx.amount;
-
-            if (!this.balances[tx.receiver]) {
-                this.balances[tx.receiver] = { BTC: 0, ETH: 0, USDT: 0 };
-            }
-
-            this.balances[tx.receiver][tx.token] += tx.amount;
 
             // SAVE TRANSACTION IN SUPABASE
 
@@ -156,8 +208,30 @@ class Blockchain {
         return "Block mined successfully";
     }
 
-    getBalance(address) {
-        return this.balances[address] || { BTC: 0, ETH: 0, USDT: 0 };
+    async getBalance(address) {
+        try {
+            const { data, error } = await supabase
+                .from('users')
+                .select('btc, eth, usdt')
+                .eq('username', address)
+                .single();
+
+            if (error || !data) {
+                console.log(`Balance for ${address}: not found`); // Debug log
+                return { BTC: 0, ETH: 0, USDT: 0 };
+            }
+
+            const balance = {
+                BTC: parseFloat(data.btc || 0),
+                ETH: parseFloat(data.eth || 0),
+                USDT: parseFloat(data.usdt || 0)
+            };
+            console.log(`Balance for ${address}:`, balance); // Debug log
+            return balance;
+        } catch (err) {
+            console.error('Error getting balance:', err);
+            return { BTC: 0, ETH: 0, USDT: 0 };
+        }
     }
 }
 
@@ -197,9 +271,9 @@ app.post("/clear-payment", (req, res) => {
 
 /* ---------------- API ROUTES ---------------- */
 
-app.post("/transaction", (req, res) => {
+app.post("/transaction", async (req, res) => {
 
-    const result = myCoin.addTransaction(req.body);
+    const result = await myCoin.addTransaction(req.body);
     res.json(result);
 
 });
@@ -217,9 +291,9 @@ app.get("/chain", (req, res) => {
 
 });
 
-app.get("/balance/:address", (req, res) => {
+app.get("/balance/:address", async (req, res) => {
 
-    const balance = myCoin.getBalance(req.params.address);
+    const balance = await myCoin.getBalance(req.params.address);
     res.json(balance);
 
 });
@@ -236,7 +310,6 @@ app.post("/login", async (req, res) => {
             .from("users")
             .select("*")
             .eq("username", username)
-            .eq("password", password)
             .single();
 
         if (error || !data) {
@@ -246,6 +319,25 @@ app.post("/login", async (req, res) => {
                 message: "Invalid username or password"
             });
 
+        }
+
+        // Decrypt stored password
+        const storedPassword = data.password;
+        if (!storedPassword.startsWith('$crypt::')) {
+            return res.json({
+                success: false,
+                message: "Invalid password format"
+            });
+        }
+
+        const encryptedPart = storedPassword.substring(8); // Remove '$crypt::'
+        const decryptedPassword = AES.decrypt(encryptedPart, ENCRYPTION_KEY).toString(Utf8);
+
+        if (decryptedPassword !== password) {
+            return res.json({
+                success: false,
+                message: "Invalid username or password"
+            });
         }
 
         res.json({
@@ -287,19 +379,17 @@ app.post("/signup", async (req, res) => {
 
         }
 
+        // Encrypt password
+        const encryptedPassword = AES.encrypt(password, ENCRYPTION_KEY).toString();
+        const storedPassword = `$crypt::${encryptedPassword}`;
+
         await supabase
             .from("users")
             .insert({
                 username,
-                password,
+                password: storedPassword,
                 role
             });
-
-        if (!myCoin.balances[username]) {
-
-            myCoin.balances[username] = { BTC: 0, ETH: 0, USDT: 0 };
-
-        }
 
         res.json({
             success: true,
