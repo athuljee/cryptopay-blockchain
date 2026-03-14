@@ -94,9 +94,25 @@ class Blockchain {
 
     async addTransaction(transaction) {
 
-        const { sender, receiver, amount, token } = transaction;
+        const { sender, receiver, amount, token, txId } = transaction;
+
+        // Validate amount inside addTransaction as well (defense in depth)
+        const numAmount = amount != null ? Number(amount) : NaN;
+        if (amount == null || Number.isNaN(numAmount) || numAmount <= 0) {
+            return { success: false, message: "Invalid transaction amount. Amount must be greater than zero." };
+        }
 
         try {
+            // Idempotency: if txId provided and already in DB, skip (for offline sync)
+            if (txId) {
+                const { data: existing, error: idemErr } = await supabase
+                    .from("transactions")
+                    .select("tx_id")
+                    .eq("tx_id", txId)
+                    .maybeSingle();
+                if (!idemErr && existing) return { success: true };
+            }
+
             // Get sender balance
             const { data: senderData, error: senderError } = await supabase
                 .from('users')
@@ -185,16 +201,17 @@ class Blockchain {
 
         for (const tx of this.pendingTransactions) {
 
-            // SAVE TRANSACTION IN SUPABASE
-
+            // SAVE TRANSACTION IN SUPABASE (tx_id for offline sync idempotency)
+            const row = {
+                sender: tx.sender,
+                receiver: tx.receiver,
+                amount: tx.amount,
+                token: tx.token
+            };
+            if (tx.txId) row.tx_id = tx.txId;
             await supabase
                 .from("transactions")
-                .insert({
-                    sender: tx.sender,
-                    receiver: tx.receiver,
-                    amount: tx.amount,
-                    token: tx.token
-                });
+                .insert(row);
 
             // NOTIFY MERCHANT TERMINAL
 
@@ -273,6 +290,17 @@ app.post("/clear-payment", (req, res) => {
 
 app.post("/transaction", async (req, res) => {
 
+    const { sender, receiver, amount, token } = req.body;
+
+    // Validate amount: must be a number greater than 0
+    const numAmount = amount != null ? Number(amount) : NaN;
+    if (amount == null || typeof amount === "undefined" || Number.isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).json({
+            success: false,
+            error: "Invalid transaction amount. Amount must be greater than zero."
+        });
+    }
+
     const result = await myCoin.addTransaction(req.body);
     res.json(result);
 
@@ -295,6 +323,31 @@ app.get("/balance/:address", async (req, res) => {
 
     const balance = await myCoin.getBalance(req.params.address);
     res.json(balance);
+
+});
+
+/* ---------------- TRANSACTION EXISTS (for offline sync idempotency) ---------------- */
+
+app.get("/transaction/exists/:txId", async (req, res) => {
+
+    const { txId } = req.params;
+    if (!txId) return res.status(400).json({ exists: false });
+
+    try {
+        const { data, error } = await supabase
+            .from("transactions")
+            .select("tx_id")
+            .eq("tx_id", txId)
+            .maybeSingle();
+
+        if (error) {
+            // If tx_id column does not exist yet, treat as not found
+            return res.json({ exists: false });
+        }
+        return res.json({ exists: !!data });
+    } catch (err) {
+        return res.json({ exists: false });
+    }
 
 });
 
