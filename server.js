@@ -377,6 +377,54 @@ app.get("/transaction/exists/:txId", async (req, res) => {
 
 });
 
+/* ---------------- TRANSFER TO OFFLINE (internal: same account, main wallet → offline reserve) ---------------- */
+
+app.post("/transfer-to-offline", async (req, res) => {
+    const { userId, token, amount } = req.body || {};
+    const numAmount = amount != null ? Number(amount) : NaN;
+    if (!userId || !token || !Number.isFinite(numAmount) || numAmount <= 0) {
+        return res.status(400).json({ success: false, error: "Invalid userId, token, or amount" });
+    }
+    const tokenUpper = String(token).toUpperCase();
+    if (!["BTC", "ETH", "USDT"].includes(tokenUpper)) {
+        return res.status(400).json({ success: false, error: "Invalid token" });
+    }
+    try {
+        const { data: userData, error: userError } = await supabase
+            .from("users")
+            .select("btc, eth, usdt")
+            .eq("username", userId)
+            .single();
+        if (userError || !userData) {
+            return res.status(404).json({ success: false, error: "User not found" });
+        }
+        const balance = {
+            BTC: parseFloat(userData.btc || 0),
+            ETH: parseFloat(userData.eth || 0),
+            USDT: parseFloat(userData.usdt || 0),
+        };
+        if (balance[tokenUpper] < numAmount) {
+            return res.status(409).json({ success: false, error: "Insufficient balance" });
+        }
+        balance[tokenUpper] -= numAmount;
+        const { error: updateErr } = await supabase
+            .from("users")
+            .update({
+                btc: balance.BTC,
+                eth: balance.ETH,
+                usdt: balance.USDT,
+            })
+            .eq("username", userId);
+        if (updateErr) {
+            return res.status(500).json({ success: false, error: "Failed to update balance" });
+        }
+        return res.json({ success: true });
+    } catch (err) {
+        console.error("transfer-to-offline error:", err);
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 /* ---------------- LOGIN USING SUPABASE ---------------- */
 
 app.post("/login", async (req, res) => {

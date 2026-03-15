@@ -251,23 +251,26 @@ app.post("/offline-wallet/load", async (req, res) => {
   }
 
   try {
-    if (!await isInternetAvailable()) {
+    if (!(await isInternetAvailable())) {
       return res.status(409).json({ ok: false, status: "rejected", error: "Internet required to load offline wallet" });
     }
 
-    const wallet = await ensureWallet(userId);
-    const onlineBalance = await getOnlineBalance(userId);
-    const onlineTokenBalance = num(onlineBalance[normalized]);
-    const reserved = num(wallet[TOKEN_TO_COLUMN[normalized]]);
-    const availableForLoad = onlineTokenBalance - reserved;
-    if (!Number.isFinite(onlineTokenBalance) || availableForLoad < amt) {
-      return res.status(409).json({
+    // Internal transfer: deduct from main wallet (same account) on the backend first
+    const transferRes = await fetch(`${ONLINE_BASE_URL}/transfer-to-offline`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId, token: normalized, amount: amt }),
+    });
+    const transferData = await transferRes.json().catch(() => ({}));
+    if (!transferRes.ok || !transferData.success) {
+      return res.status(transferRes.status || 409).json({
         ok: false,
         status: "rejected",
-        error: "Insufficient available main wallet for offline load",
+        error: transferData.error || "Failed to deduct from main wallet",
       });
     }
 
+    // Then credit the same user's offline wallet locally (no double-counting)
     const result = await adjustWallet(userId, normalized, amt);
     if (!result.ok) {
       return res.status(409).json({ ok: false, status: "rejected", error: result.reason });
