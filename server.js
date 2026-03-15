@@ -94,7 +94,7 @@ class Blockchain {
 
     async addTransaction(transaction) {
 
-        const { sender, receiver, amount, token, txId } = transaction;
+        const { sender, receiver, amount, token, txId, is_offline_payment } = transaction;
 
         // Validate amount inside addTransaction as well (defense in depth)
         const numAmount = amount != null ? Number(amount) : NaN;
@@ -111,6 +111,13 @@ class Blockchain {
                     .eq("tx_id", txId)
                     .maybeSingle();
                 if (!idemErr && existing) return { success: true };
+            }
+
+            // Offline sync: only record the transaction (no balance move). Balances were already
+            // updated on the offline server during the offline payment; sync just finalizes the ledger.
+            if (txId && is_offline_payment) {
+                this.pendingTransactions.push(transaction);
+                return { success: true };
             }
 
             // Get sender balance
