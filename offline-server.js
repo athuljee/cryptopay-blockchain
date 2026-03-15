@@ -1,3 +1,10 @@
+/**
+ * Offline payment server: runs on the merchant terminal (e.g. localhost:3001).
+ * Does NOT write to Supabase. All offline transactions are stored locally (SQLite)
+ * with status pending_sync, then synced to the main backend when internet is restored.
+ * The main backend (server.js) records synced transactions in Supabase and prevents
+ * duplicates via tx_id idempotency.
+ */
 const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
