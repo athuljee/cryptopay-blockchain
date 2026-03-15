@@ -4,10 +4,24 @@ const cors = require("cors");
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
 const { randomUUID } = require("crypto");
+const winston = require("winston");
 
-const ONLINE_BASE_URL = process.env.ONLINE_BASE_URL || "http://localhost:3000";
+const logger = winston.createLogger({
+  level: "info",
+  format: winston.format.combine(
+    winston.format.timestamp({ format: "YYYY-MM-DD HH:mm:ss" }),
+    winston.format.printf(({ level, message, timestamp, ...meta }) => {
+      const metaStr = Object.keys(meta).length ? " " + JSON.stringify(meta) : "";
+      return `${timestamp} ${level.toUpperCase()}: ${message}${metaStr}`;
+    }),
+  ),
+  transports: [new winston.transports.Console()],
+});
+
+const ONLINE_BASE_URL = process.env.ONLINE_BASE_URL || "https://cryptopay-blockchain.onrender.com";
 const OFFLINE_SERVER_PORT = Number(process.env.OFFLINE_SERVER_PORT || 3001);
 const DB_PATH = process.env.OFFLINE_DB_PATH || path.join(__dirname, "offline-store.db");
+const SYNC_INTERVAL_MS = 30 * 1000;
 
 const app = express();
 app.use(bodyParser.json());
@@ -328,6 +342,14 @@ app.post("/offline-transfer", async (req, res) => {
     return res.status(400).json({ ok: false, status: "rejected", error: "Invalid transfer payload" });
   }
 
+  logger.info("[OFFLINE TX] Received transaction " + finalTxId, {
+    from: fromUserId,
+    to: toUserId,
+    merchantId: merchantId || toUserId,
+    amount: amt,
+    token: normalized,
+  });
+
   try {
     const existing = await get("SELECT tx_id, status FROM offline_transactions WHERE tx_id = ?", [finalTxId]);
     if (existing) {
@@ -356,6 +378,7 @@ app.post("/offline-transfer", async (req, res) => {
           deductResult.reason,
         ],
       );
+      logger.warn("[OFFLINE TX] Rejected " + finalTxId + " reason=" + deductResult.reason);
       return res.status(409).json({
         ok: false,
         txId: finalTxId,
@@ -391,8 +414,10 @@ app.post("/offline-transfer", async (req, res) => {
       ],
     );
 
+    logger.info("[OFFLINE TX] Stored locally as pending_sync", { txId: finalTxId });
     return res.json({ ok: true, txId: finalTxId, status: "pending_sync" });
   } catch (err) {
+    logger.error("[OFFLINE TX] Error processing " + finalTxId, { error: err.message });
     return res.status(500).json({ ok: false, status: "failed", error: err.message });
   }
 });
@@ -427,85 +452,103 @@ app.get("/offline-transactions", async (req, res) => {
   }
 });
 
-app.post("/sync-offline-transactions", async (_req, res) => {
-  try {
-    if (!await isInternetAvailable()) {
-      return res.status(409).json({ ok: false, error: "Internet unavailable" });
-    }
+async function runSync() {
+  if (!(await isInternetAvailable())) {
+    return null;
+  }
+  logger.info("[SYNC] Checking internet connection...");
+  const pending = await all(
+    "SELECT * FROM offline_transactions WHERE sync_status IN ('pending', 'failed') ORDER BY COALESCE(offline_created_at, created_at) ASC LIMIT 300",
+  );
+  if (pending.length === 0) {
+    return { processed: 0, synced: 0, failed: 0, rejected: 0 };
+  }
+  let synced = 0;
+  let failed = 0;
+  let rejected = 0;
 
-    const pending = await all(
-      "SELECT * FROM offline_transactions WHERE sync_status IN ('pending', 'failed') ORDER BY COALESCE(offline_created_at, created_at) ASC LIMIT 300",
-    );
-    let synced = 0;
-    let failed = 0;
-    let rejected = 0;
-
-    for (const tx of pending) {
-      try {
-        const existsRes = await fetch(`${ONLINE_BASE_URL}/transaction/exists/${encodeURIComponent(tx.tx_id)}`);
-        if (existsRes.ok) {
-          const existsData = await existsRes.json();
-          if (existsData.exists === true) {
-            await run(
-              "UPDATE offline_transactions SET status = 'synced', sync_status = 'synced', synced_at = CURRENT_TIMESTAMP, blockchain_synced_at = CURRENT_TIMESTAMP, sync_error = NULL WHERE tx_id = ?",
-              [tx.tx_id],
-            );
-            synced++;
-            continue;
-          }
-        }
-
-        const submitRes = await fetch(`${ONLINE_BASE_URL}/transaction`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            sender: tx.from_user_id,
-            receiver: tx.to_user_id,
-            amount: Number(tx.amount),
-            token: tx.token,
-            txId: tx.tx_id,
-            is_offline_payment: true,
-            offline_created_at: tx.offline_created_at || tx.created_at,
-            offline_received_at: tx.offline_received_at || tx.created_at,
-            blockchain_synced_at: new Date().toISOString(),
-            sync_status: "synced",
-          }),
-        });
-        const submitBody = await submitRes.json();
-
-        if (submitRes.ok && submitBody?.success === true) {
-          await fetch(`${ONLINE_BASE_URL}/mine`);
+  for (const tx of pending) {
+    try {
+      const existsRes = await fetch(`${ONLINE_BASE_URL}/transaction/exists/${encodeURIComponent(tx.tx_id)}`);
+      if (existsRes.ok) {
+        const existsData = await existsRes.json();
+        if (existsData.exists === true) {
           await run(
             "UPDATE offline_transactions SET status = 'synced', sync_status = 'synced', synced_at = CURRENT_TIMESTAMP, blockchain_synced_at = CURRENT_TIMESTAMP, sync_error = NULL WHERE tx_id = ?",
             [tx.tx_id],
           );
           synced++;
-        } else {
-          const msg = submitBody?.message || submitBody?.error || "sync_failed";
-          const nextStatus = String(msg).toLowerCase().includes("insufficient") ? "rejected" : "failed";
-          await run(
-            "UPDATE offline_transactions SET status = ?, sync_status = 'failed', sync_error = ? WHERE tx_id = ?",
-            [nextStatus, msg, tx.tx_id],
-          );
-          if (nextStatus === "rejected") rejected++;
-          else failed++;
+          logger.info("[SYNC SUCCESS] " + tx.tx_id + " synced to blockchain (already existed)");
+          continue;
         }
-      } catch (err) {
-        await run(
-          "UPDATE offline_transactions SET status = 'failed', sync_status = 'failed', sync_error = ? WHERE tx_id = ?",
-          [err.message, tx.tx_id],
-        );
-        failed++;
       }
-    }
 
-    return res.json({
-      ok: true,
-      processed: pending.length,
-      synced,
-      failed,
-      rejected,
-    });
+      const submitRes = await fetch(`${ONLINE_BASE_URL}/transaction`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sender: tx.from_user_id,
+          receiver: tx.to_user_id,
+          amount: Number(tx.amount),
+          token: tx.token,
+          txId: tx.tx_id,
+          is_offline_payment: true,
+          offline_created_at: tx.offline_created_at || tx.created_at,
+          offline_received_at: tx.offline_received_at || tx.created_at,
+          blockchain_synced_at: new Date().toISOString(),
+          sync_status: "synced",
+        }),
+      });
+      const submitBody = await submitRes.json();
+
+      if (submitRes.ok && submitBody?.success === true) {
+        await fetch(`${ONLINE_BASE_URL}/mine`);
+        await run(
+          "UPDATE offline_transactions SET status = 'synced', sync_status = 'synced', synced_at = CURRENT_TIMESTAMP, blockchain_synced_at = CURRENT_TIMESTAMP, sync_error = NULL WHERE tx_id = ?",
+          [tx.tx_id],
+        );
+        synced++;
+        logger.info("[SYNC SUCCESS] " + tx.tx_id + " synced to blockchain");
+      } else {
+        const msg = submitBody?.message || submitBody?.error || "sync_failed";
+        const nextStatus = String(msg).toLowerCase().includes("insufficient") ? "rejected" : "failed";
+        await run(
+          "UPDATE offline_transactions SET status = ?, sync_status = 'failed', sync_error = ? WHERE tx_id = ?",
+          [nextStatus, msg, tx.tx_id],
+        );
+        if (nextStatus === "rejected") rejected++;
+        else failed++;
+        logger.error("[SYNC ERROR] Failed to sync " + tx.tx_id + " Reason: " + msg);
+      }
+    } catch (err) {
+      await run(
+        "UPDATE offline_transactions SET status = 'failed', sync_status = 'failed', sync_error = ? WHERE tx_id = ?",
+        [err.message, tx.tx_id],
+      );
+      failed++;
+      logger.error("[SYNC ERROR] Failed to sync " + tx.tx_id + " Reason: " + err.message);
+    }
+  }
+
+  return { processed: pending.length, synced, failed, rejected };
+}
+
+app.post("/sync-offline-transactions", async (_req, res) => {
+  try {
+    if (!(await isInternetAvailable())) {
+      return res.status(409).json({ ok: false, error: "Internet unavailable" });
+    }
+    const result = await runSync();
+    if (result) {
+      return res.json({
+        ok: true,
+        processed: result.processed,
+        synced: result.synced,
+        failed: result.failed,
+        rejected: result.rejected,
+      });
+    }
+    return res.json({ ok: true, processed: 0, synced: 0, failed: 0, rejected: 0 });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
@@ -514,11 +557,18 @@ app.post("/sync-offline-transactions", async (_req, res) => {
 initDb()
   .then(() => {
     app.listen(OFFLINE_SERVER_PORT, "0.0.0.0", () => {
-      console.log(`Offline server running on port ${OFFLINE_SERVER_PORT}`);
-      console.log(`Sync target ONLINE_BASE_URL=${ONLINE_BASE_URL}`);
+      logger.info("[OFFLINE SERVER] Running on port " + OFFLINE_SERVER_PORT);
+      logger.info("[OFFLINE SERVER] Sync target ONLINE_BASE_URL=" + ONLINE_BASE_URL);
+      setInterval(() => {
+        isInternetAvailable()
+          .then((ok) => {
+            if (ok) runSync();
+          })
+          .catch(() => {});
+      }, SYNC_INTERVAL_MS);
     });
   })
   .catch((err) => {
-    console.error("Failed to initialize offline DB", err);
+    logger.error("Failed to initialize offline DB", { error: err.message });
     process.exit(1);
   });
