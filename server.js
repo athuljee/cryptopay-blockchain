@@ -209,9 +209,28 @@ class Blockchain {
                 token: tx.token
             };
             if (tx.txId) row.tx_id = tx.txId;
-            await supabase
+            // Optional offline metadata (keeps online flow unchanged when absent).
+            if (typeof tx.is_offline_payment !== "undefined") row.is_offline_payment = !!tx.is_offline_payment;
+            if (tx.offline_created_at) row.offline_created_at = tx.offline_created_at;
+            if (tx.offline_received_at) row.offline_received_at = tx.offline_received_at;
+            if (tx.blockchain_synced_at) row.blockchain_synced_at = tx.blockchain_synced_at;
+            if (tx.sync_status) row.sync_status = tx.sync_status;
+            const { error: insertErr } = await supabase
                 .from("transactions")
                 .insert(row);
+            // If new columns are missing in DB, retry with base schema so online flow is never broken.
+            if (insertErr) {
+                const fallbackRow = {
+                    sender: tx.sender,
+                    receiver: tx.receiver,
+                    amount: tx.amount,
+                    token: tx.token
+                };
+                if (tx.txId) fallbackRow.tx_id = tx.txId;
+                await supabase
+                    .from("transactions")
+                    .insert(fallbackRow);
+            }
 
             // NOTIFY MERCHANT TERMINAL
 

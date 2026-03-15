@@ -32,12 +32,17 @@ create table if not exists public.offline_transactions (
   merchant_id text,
   amount numeric not null check (amount > 0),
   token text not null,
+  is_offline_payment boolean not null default true,
+  sync_status text not null default 'pending',
   mode text not null default 'offline',
   status text not null,
   nonce bigint,
   signature text,
   source_device_id text,
   local_server_id text,
+  offline_created_at timestamptz,
+  offline_received_at timestamptz,
+  blockchain_synced_at timestamptz,
   created_at timestamptz not null default now(),
   synced_at timestamptz,
   sync_error text
@@ -51,3 +56,18 @@ create index if not exists idx_offline_transactions_merchant
 
 create index if not exists idx_offline_wallet_loads_user
   on public.offline_wallet_loads (user_id);
+
+alter table public.transactions
+  add column if not exists is_offline_payment boolean default false;
+
+alter table public.transactions
+  add column if not exists offline_created_at timestamptz;
+
+alter table public.transactions
+  add column if not exists offline_received_at timestamptz;
+
+alter table public.transactions
+  add column if not exists blockchain_synced_at timestamptz;
+
+alter table public.transactions
+  add column if not exists sync_status text;

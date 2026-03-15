@@ -86,17 +86,29 @@ async function initDb() {
       merchant_id TEXT,
       amount REAL NOT NULL,
       token TEXT NOT NULL,
+      is_offline_payment INTEGER NOT NULL DEFAULT 1,
+      sync_status TEXT NOT NULL DEFAULT 'pending',
       mode TEXT NOT NULL DEFAULT 'offline',
       status TEXT NOT NULL,
       nonce INTEGER,
       signature TEXT,
       source_device_id TEXT,
       local_server_id TEXT,
+      offline_created_at TEXT,
+      offline_received_at TEXT,
+      blockchain_synced_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       synced_at TEXT,
       sync_error TEXT
     )
   `);
+
+  // Backward-compatible schema upgrades for existing sqlite DBs.
+  await run(`ALTER TABLE offline_transactions ADD COLUMN is_offline_payment INTEGER NOT NULL DEFAULT 1`).catch(() => {});
+  await run(`ALTER TABLE offline_transactions ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'pending'`).catch(() => {});
+  await run(`ALTER TABLE offline_transactions ADD COLUMN offline_created_at TEXT`).catch(() => {});
+  await run(`ALTER TABLE offline_transactions ADD COLUMN offline_received_at TEXT`).catch(() => {});
+  await run(`ALTER TABLE offline_transactions ADD COLUMN blockchain_synced_at TEXT`).catch(() => {});
 }
 
 const TOKEN_TO_COLUMN = {
@@ -182,7 +194,7 @@ async function adjustWallet(userId, token, delta, { nonce = null } = {}) {
 app.get("/health", async (_req, res) => {
   try {
     const pending = await get(
-      "SELECT COUNT(*) AS c FROM offline_transactions WHERE status IN ('pending_local','pending_sync','failed')",
+      "SELECT COUNT(*) AS c FROM offline_transactions WHERE sync_status IN ('pending','failed')",
     );
     res.json({
       ok: true,
@@ -305,6 +317,8 @@ app.post("/offline-transfer", async (req, res) => {
     signature,
     sourceDeviceId,
     localServerId,
+    offlineCreatedAt,
+    offlineReceivedAt,
   } = req.body || {};
 
   const normalized = normalizeToken(token);
@@ -324,8 +338,8 @@ app.post("/offline-transfer", async (req, res) => {
     if (!deductResult.ok) {
       await run(
         `INSERT INTO offline_transactions
-         (tx_id, from_user_id, to_user_id, merchant_id, amount, token, mode, status, nonce, signature, source_device_id, local_server_id, sync_error)
-         VALUES (?, ?, ?, ?, ?, ?, 'offline', 'rejected', ?, ?, ?, ?, ?)`,
+         (tx_id, from_user_id, to_user_id, merchant_id, amount, token, is_offline_payment, sync_status, mode, status, nonce, signature, source_device_id, local_server_id, offline_created_at, offline_received_at, sync_error)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 'failed', 'offline', 'rejected', ?, ?, ?, ?, ?, ?, ?)`,
         [
           finalTxId,
           fromUserId,
@@ -337,6 +351,8 @@ app.post("/offline-transfer", async (req, res) => {
           signature || null,
           sourceDeviceId || null,
           localServerId || null,
+          offlineCreatedAt || new Date().toISOString(),
+          offlineReceivedAt || new Date().toISOString(),
           deductResult.reason,
         ],
       );
@@ -357,8 +373,8 @@ app.post("/offline-transfer", async (req, res) => {
 
     await run(
       `INSERT INTO offline_transactions
-       (tx_id, from_user_id, to_user_id, merchant_id, amount, token, mode, status, nonce, signature, source_device_id, local_server_id)
-       VALUES (?, ?, ?, ?, ?, ?, 'offline', 'pending_sync', ?, ?, ?, ?)`,
+       (tx_id, from_user_id, to_user_id, merchant_id, amount, token, is_offline_payment, sync_status, mode, status, nonce, signature, source_device_id, local_server_id, offline_created_at, offline_received_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, 'pending', 'offline', 'pending_sync', ?, ?, ?, ?, ?, ?)`,
       [
         finalTxId,
         fromUserId,
@@ -370,6 +386,8 @@ app.post("/offline-transfer", async (req, res) => {
         signature || null,
         sourceDeviceId || null,
         localServerId || null,
+        offlineCreatedAt || new Date().toISOString(),
+        offlineReceivedAt || new Date().toISOString(),
       ],
     );
 
@@ -399,7 +417,7 @@ app.get("/offline-transactions", async (req, res) => {
     const sql = `
       SELECT * FROM offline_transactions
       ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-      ORDER BY created_at DESC
+      ORDER BY COALESCE(offline_created_at, created_at) DESC
       LIMIT 300
     `;
     const rows = await all(sql, params);
@@ -416,7 +434,7 @@ app.post("/sync-offline-transactions", async (_req, res) => {
     }
 
     const pending = await all(
-      "SELECT * FROM offline_transactions WHERE status IN ('pending_local', 'pending_sync', 'failed') ORDER BY created_at ASC LIMIT 300",
+      "SELECT * FROM offline_transactions WHERE sync_status IN ('pending', 'failed') ORDER BY COALESCE(offline_created_at, created_at) ASC LIMIT 300",
     );
     let synced = 0;
     let failed = 0;
@@ -429,7 +447,7 @@ app.post("/sync-offline-transactions", async (_req, res) => {
           const existsData = await existsRes.json();
           if (existsData.exists === true) {
             await run(
-              "UPDATE offline_transactions SET status = 'synced', synced_at = CURRENT_TIMESTAMP, sync_error = NULL WHERE tx_id = ?",
+              "UPDATE offline_transactions SET status = 'synced', sync_status = 'synced', synced_at = CURRENT_TIMESTAMP, blockchain_synced_at = CURRENT_TIMESTAMP, sync_error = NULL WHERE tx_id = ?",
               [tx.tx_id],
             );
             synced++;
@@ -446,6 +464,11 @@ app.post("/sync-offline-transactions", async (_req, res) => {
             amount: Number(tx.amount),
             token: tx.token,
             txId: tx.tx_id,
+            is_offline_payment: true,
+            offline_created_at: tx.offline_created_at || tx.created_at,
+            offline_received_at: tx.offline_received_at || tx.created_at,
+            blockchain_synced_at: new Date().toISOString(),
+            sync_status: "synced",
           }),
         });
         const submitBody = await submitRes.json();
@@ -453,7 +476,7 @@ app.post("/sync-offline-transactions", async (_req, res) => {
         if (submitRes.ok && submitBody?.success === true) {
           await fetch(`${ONLINE_BASE_URL}/mine`);
           await run(
-            "UPDATE offline_transactions SET status = 'synced', synced_at = CURRENT_TIMESTAMP, sync_error = NULL WHERE tx_id = ?",
+            "UPDATE offline_transactions SET status = 'synced', sync_status = 'synced', synced_at = CURRENT_TIMESTAMP, blockchain_synced_at = CURRENT_TIMESTAMP, sync_error = NULL WHERE tx_id = ?",
             [tx.tx_id],
           );
           synced++;
@@ -461,7 +484,7 @@ app.post("/sync-offline-transactions", async (_req, res) => {
           const msg = submitBody?.message || submitBody?.error || "sync_failed";
           const nextStatus = String(msg).toLowerCase().includes("insufficient") ? "rejected" : "failed";
           await run(
-            "UPDATE offline_transactions SET status = ?, sync_error = ? WHERE tx_id = ?",
+            "UPDATE offline_transactions SET status = ?, sync_status = 'failed', sync_error = ? WHERE tx_id = ?",
             [nextStatus, msg, tx.tx_id],
           );
           if (nextStatus === "rejected") rejected++;
@@ -469,7 +492,7 @@ app.post("/sync-offline-transactions", async (_req, res) => {
         }
       } catch (err) {
         await run(
-          "UPDATE offline_transactions SET status = 'failed', sync_error = ? WHERE tx_id = ?",
+          "UPDATE offline_transactions SET status = 'failed', sync_status = 'failed', sync_error = ? WHERE tx_id = ?",
           [err.message, tx.tx_id],
         );
         failed++;
